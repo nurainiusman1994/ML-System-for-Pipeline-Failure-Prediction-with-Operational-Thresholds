@@ -1,1 +1,142 @@
+import streamlit as st
+import joblib # Use joblib instead of pickle
+import numpy as np
+import pandas as pd # Import pandas for creating DataFrame
 
+# Load model
+try:
+    with open("pipeline_thickness_model.pkl", "rb") as file:
+        model = joblib.load(file) # Use joblib.load
+except FileNotFoundError:
+    st.error("Model file 'pipeline_thickness_model.pkl' not found. Please ensure the model training and saving steps were completed.")
+    st.stop() # Stop the app if the model cannot be loaded
+except Exception as e:
+    st.error(f"Error loading model: {e}")
+    st.stop() # Stop the app if the model cannot be loaded
+
+
+# Load thresholds
+try:
+    import json
+    with open('operational_thresholds.json', 'r') as f:
+        thresholds = json.load(f)
+except FileNotFoundError:
+    st.warning("Thresholds file not found. Proceeding without threshold checks.")
+    thresholds = {} # Provide an empty dictionary as fallback
+except Exception as e:
+    st.warning(f"Error loading thresholds: {e}. Proceeding without threshold checks.")
+    thresholds = {}
+
+
+# Title and description
+st.title("Pipeline Failure Risk Prediction")
+st.write("Predict the condition of a pipeline segment based on operational data.")
+
+# Input fields
+# Get the list of features the model expects
+# This assumes the model's preprocessor has a get_feature_names_out or similar method
+# A more robust way is to get the feature names from the training data before preprocessing
+# For now, let's manually define the expected input fields based on the training data columns (excluding the target 'Condition')
+# Add the missing columns from the sample_input in cell JqjAljIJCZKW
+
+input_features = [
+    'Pipe_Size_mm', 'Thickness_mm', 'Material', 'Grade', 'Max_Pressure_psi',
+    'Temperature_C', 'Corrosion_Impact_Percent', 'Thickness_Loss_mm',
+    'Material_Loss_Percent', 'Time_Years'
+]
+
+input_data = {}
+st.sidebar.header("Input Parameters")
+
+# Create input fields for each feature
+for feature in input_features:
+    if feature in ['Pipe_Size_mm', 'Max_Pressure_psi', 'Time_Years']:
+        input_data[feature] = st.sidebar.number_input(feature, step=1.0, value=0.0)
+    elif feature in ['Thickness_mm', 'Temperature_C', 'Corrosion_Impact_Percent', 'Thickness_Loss_mm', 'Material_Loss_Percent']:
+         input_data[feature] = st.sidebar.number_input(feature, step=0.1, value=0.0)
+    elif feature in ['Material', 'Grade']:
+        # You might need to get the unique values from your training data for a selectbox
+        # For now, using text input
+        input_data[feature] = st.sidebar.text_input(feature, value="")
+
+
+# Predict button
+if st.button("Predict Pipeline Condition"):
+    try:
+        # Create a DataFrame from input data
+        df_input = pd.DataFrame([input_data])
+
+        # Perform feature engineering - MUST MATCH the engineering in training
+        # Ensure these columns are present before creating engineered features
+        required_for_engineering = ['Max_Pressure_psi', 'Temperature_C', 'Thickness_Loss_mm', 'Thickness_mm', 'Time_Years']
+        if all(col in df_input.columns for col in required_for_engineering):
+            df_input['PRESSURE_TEMP_PRODUCT'] = df_input['Max_Pressure_psi'] * df_input['Temperature_C']
+            # Handle potential division by zero if Thickness_mm is 0
+            df_input['THICKNESS_RATIO'] = df_input['Thickness_Loss_mm'] / (df_input['Thickness_mm'].replace(0, 1e-5)) # Add small epsilon
+            df_input['ANNUAL_LOSS_RATE'] = df_input['Thickness_Loss_mm'] / (df_input['Time_Years'].replace(0, 1e-5)) # Add small epsilon
+        else:
+            st.error("Missing columns for feature engineering. Please provide all required inputs.")
+            st.stop() # Stop execution if feature engineering cannot be performed
+
+
+        # Prediction
+        prediction = model.predict(df_input)[0]
+
+
+        # Display result
+        st.subheader("Prediction:")
+        if prediction == "Normal":
+            st.success(f"✅ Predicted Pipeline Condition: {prediction}")
+        elif prediction == "Moderate":
+            st.warning(f"⚠️ Predicted Pipeline Condition: {prediction}")
+        elif prediction == "Critical":
+            st.error(f"🚨 Predicted Pipeline Condition: {prediction}")
+        else:
+            st.info(f"Predicted Pipeline Condition: {prediction}")
+
+        # Display probabilities if available
+        if hasattr(model, 'predict_proba'):
+            proba = model.predict_proba(df_input)[0]
+            st.subheader("Prediction Probabilities:")
+            # Display probabilities with class names
+            proba_dict = dict(zip(model.classes_, np.round(proba, 3)))
+            st.json(proba_dict)
+        else:
+            st.info("Prediction probabilities are not available for this model.")
+
+
+        # Check thresholds if loaded and relevant
+        if thresholds:
+            st.subheader("Threshold Alerts:")
+            alerts = []
+            # Define a mapping from input_data keys to thresholds keys if they differ
+            # Include engineered features used for thresholds
+            threshold_keys_mapping = {
+                'Temperature_C': 'Temperature_C',
+                'Max_Pressure_psi': 'Max_Pressure_psi',
+                'Thickness_Loss_mm': 'Thickness_Loss_mm',
+                 'ANNUAL_LOSS_RATE': 'Annual_Loss_Rate', # Use the engineered feature name for threshold comparison
+                 'Corrosion_Impact_Percent': 'Corrosion_Impact' # Use the correct key from thresholds
+            }
+
+            # Check relevant features against thresholds
+            # Iterate through the mapping to check both original and engineered features
+            for df_col, threshold_key in threshold_keys_mapping.items():
+                 # Check if the column exists in the input DataFrame (this covers both original and engineered features used for thresholds)
+                 if df_col in df_input.columns and threshold_key in thresholds:
+                    # Use .iloc[0] to get the single value from the DataFrame cell
+                    if df_input[df_col].iloc[0] > thresholds[threshold_key]:
+                         alerts.append(f"{df_col} ({df_input[df_col].iloc[0]:.2f}) exceeds safety limit for {threshold_key} (> {thresholds[threshold_key]:.2f})")
+
+
+            if alerts:
+                for alert in alerts:
+                    st.warning(alert)
+            else:
+                st.info("No threshold limits exceeded.")
+        else:
+             st.info("Thresholds not loaded. Cannot check for alerts.")
+
+
+    except Exception as e:
+        st.error(f"An error occurred during prediction: {e}")
